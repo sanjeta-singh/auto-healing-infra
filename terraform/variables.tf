@@ -62,3 +62,13 @@ variable "computer_name" {
   type        = string
   description = "Computer name for the Virtual Machine"
 }
+
+variable "shared_resource_group_name" {
+  type        = string
+  description = "Name of the centralized resource group for automation tools"
+}
+
+variable "function_app_name" {
+  type        = string
+  description = "Base name for the Azure Function App"
+}
