@@ -1,0 +1,13 @@
+resource_group_name      = "healing-automation"
+resource_group_location  = "Central India"
+vnet_cidr_address_space  = ["10.0.0.0/24"]
+vnet_cidr_name           = "automation-vnet"
+subnet_name              = "automation-subnet"
+subnet_address_space     = ["10.0.0.0/25"]
+network_interface_name   = "automation-nic"
+public_ip_name           = "automation-ip"
+network_security_group_name = "automation-nsg"
+vm_name                  = "autoheal"
+vm_size                  = "Standard_B1s"
+admin_username_vm        = "sanjeta"
+computer_name            = "autoheal"
