@@ -17,24 +17,36 @@ terraform {
 }
 
 provider "azurerm" {
-  features {}
+  features {
+    resource_group {
+      prevent_deletion_if_contains_resources = false
+    }
+  }
 }
 
-# ~> means increament the rightmost number only for eg in 3.0.2 only the last rightmost number 2 can be changed like 3.0.10 but never 3.1.0
-
 ###########################################################
-## 1. DATA SOURCES & PACKAGING
+## 1. DATA SOURCES, AUTOMATED PACKAGING & LOCAL BUILDS
 ###########################################################
 
-# Automatically packages local Python code into a deployment zip
+resource "null_resource" "pip_install" {
+  triggers = {
+    requirements_hash = filemd5("${path.module}/../automation-function/requirements.txt")
+  }
+  provisioner "local-exec" {
+    command = "pip3 install -r ${path.module}/../automation-function/requirements.txt --target=\"${path.module}/../automation-function/.python_packages/lib/site-packages\""
+  }
+}
+
 data "archive_file" "function_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../automation-function"
   output_path = "${path.module}/function.zip"
+  excludes    = [".venv", "venv", "__pycache__", "function.zip"]
+  depends_on  = [null_resource.pip_install]
 }
 
 ###########################################################
-##   2. resources group   ##
+## 2. RESOURCES GROUP & NETWORKING
 ###########################################################
 
 resource "azurerm_resource_group" "rg" {
@@ -84,6 +96,18 @@ resource "azurerm_network_security_group" "nsg" {
     source_address_prefix      = "*"
     destination_address_prefix = "*"
   }
+
+  security_rule {
+    name                       = "AllowFlask"
+    priority                   = 1003
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "5000"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
 }
 
 resource "azurerm_public_ip" "pip" {
@@ -120,9 +144,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
   computer_name                   = var.computer_name
   disable_password_authentication = true
 
-  network_interface_ids = [
-    azurerm_network_interface.nic.id,
-  ]
+  network_interface_ids = [azurerm_network_interface.nic.id]
 
   admin_ssh_key {
     username   = var.admin_username_vm
@@ -143,13 +165,8 @@ resource "azurerm_linux_virtual_machine" "vm" {
 }
 
 ###########################################################
-## 3. AUTOMATION & MONITORING INFRASTRUCTURE (THE HUB)
+## 3. AUTOMATION & MONITORING INFRASTRUCTURE
 ###########################################################
-
-resource "azurerm_resource_group" "rg_shared" {
-  name     = var.shared_resource_group_name
-  location = var.resource_group_location
-}
 
 resource "random_integer" "storage_id" {
   min = 10000
@@ -158,33 +175,61 @@ resource "random_integer" "storage_id" {
 
 resource "azurerm_storage_account" "func_storage" {
   name                     = "healfuncstorage${random_integer.storage_id.result}"
-  resource_group_name      = azurerm_resource_group.rg_shared.name
-  location                 = azurerm_resource_group.rg_shared.location
+  resource_group_name      = azurerm_resource_group.rg.name
+  location                 = azurerm_resource_group.rg.location
   account_tier             = "Standard"
   account_replication_type = "LRS"
 }
 
 resource "azurerm_service_plan" "func_plan" {
   name                = "autoheal-app-plan"
-  resource_group_name = azurerm_resource_group.rg_shared.name
-  location            = azurerm_resource_group.rg_shared.location
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
   os_type             = "Linux"
-  sku_name            = "Y1"
+  sku_name            = "S1"
+}
+
+resource "azurerm_log_analytics_workspace" "workspace" {
+  name                = "autoheal-log-workspace"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+}
+
+resource "azurerm_application_insights" "app_insights" {
+  name                = "${var.function_app_name}-insights"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  workspace_id        = azurerm_log_analytics_workspace.workspace.id
+  application_type    = "web"
 }
 
 resource "azurerm_linux_function_app" "heal_func" {
   name                       = "${var.function_app_name}-${random_integer.storage_id.result}"
-  resource_group_name        = azurerm_resource_group.rg_shared.name
-  location                   = azurerm_resource_group.rg_shared.location
+  resource_group_name        = azurerm_resource_group.rg.name
+  location                   = azurerm_resource_group.rg.location
   service_plan_id            = azurerm_service_plan.func_plan.id
   storage_account_name       = azurerm_storage_account.func_storage.name
   storage_account_access_key = azurerm_storage_account.func_storage.primary_access_key
   zip_deploy_file            = data.archive_file.function_zip.output_path
 
   site_config {
+    always_on = true
     application_stack {
-      python_version = "3.11"
+      python_version = "3.12"
     }
+  }
+
+  app_settings = {
+    "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.app_insights.connection_string
+    "FUNCTIONS_WORKER_RUNTIME"              = "python"
+    "AzureWebJobsFeatureFlags"              = "EnableWorkerIndexing"
+    "AzureWebJobsStorage"                   = azurerm_storage_account.func_storage.primary_connection_string
+    "WEBSITE_RUN_FROM_PACKAGE"              = "1"
+    "TARGET_VM_NAME"                        = azurerm_linux_virtual_machine.vm.name
+    "TARGET_RESOURCE_GROUP"                 = azurerm_resource_group.rg.name
+    "TARGET_SUBSCRIPTION_ID"                = "5dd09e90-5d01-4fe1-aa6d-3f17def1c0f8"
   }
 
   identity {
@@ -192,11 +237,6 @@ resource "azurerm_linux_function_app" "heal_func" {
   }
 }
 
-###########################################################
-## 4. ROLE-BASED ACCESS CONTROL (IAM SECURITY BRIDGE)
-###########################################################
-
-# Assign role at the Parent Resource Group level so it inherits down to 100s of VMs seamlessly
 resource "azurerm_role_assignment" "vm_group_contributor" {
   scope                = azurerm_resource_group.rg.id
   role_definition_name = "Virtual Machine Contributor"
@@ -207,16 +247,15 @@ resource "azurerm_role_assignment" "vm_group_contributor" {
 ## 5. LIVE OBSERVABILITY LOOP & WEBHOOKS
 ###########################################################
 
-# Intercepts and retrieves the internal app password/host key programmatically
 data "azurerm_function_app_host_keys" "func_keys" {
   name                = azurerm_linux_function_app.heal_func.name
-  resource_group_name = azurerm_resource_group.rg_shared.name
+  resource_group_name = azurerm_resource_group.rg.name
   depends_on          = [azurerm_linux_function_app.heal_func]
 }
 
 resource "azurerm_monitor_action_group" "remediation_ag" {
   name                = "remediation-action-group"
-  resource_group_name = azurerm_resource_group.rg_shared.name
+  resource_group_name = azurerm_resource_group.rg.name
   short_name          = "AutoHealAG"
 
   webhook_receiver {
@@ -226,20 +265,41 @@ resource "azurerm_monitor_action_group" "remediation_ag" {
   }
 }
 
-resource "azurerm_monitor_metric_alert" "network_drop_alert" {
-  name                = "zero-inbound-traffic-alert"
+resource "azurerm_application_insights_web_test" "flask_health_check" {
+  name                    = "flask-app-health-test"
+  location                = azurerm_resource_group.rg.location
+  resource_group_name     = azurerm_resource_group.rg.name
+  application_insights_id = azurerm_application_insights.app_insights.id
+  kind                    = "ping"
+  frequency               = 300
+  timeout                 = 30
+  enabled                 = true
+  geo_locations           = ["apac-sg-sin-azr", "us-va-ash-azr"]
+
+  configuration = <<XML
+<WebTest Name="flask-app-health-test" Id="A1B2C3D4-E5F6-7A8B-9C0D-1E2F3A4B5C6D" Enabled="True" CatalogClassName="" CatalogDisplayName="" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Items>
+    <Request Method="GET" Guid="B2C3D4E5-F6A7-8B9C-0D1E-2F3A4B5C6D7E" Version="1.1" Url="http://${azurerm_public_ip.pip.ip_address}/health" ThinkTime="0" Timeout="30" ParseDependentRequests="False" FollowRedirects="True" RecordResult="True" Cache="False" ResponseTimeGoal="0" AcceptLanguage="" Accept="" Headers="" Body="" />
+  </Items>
+</WebTest>
+XML
+}
+
+resource "azurerm_monitor_metric_alert" "app_insights_alert" {
+  name                = "flask-app-down-alert"
   resource_group_name = azurerm_resource_group.rg.name
-  scopes              = [azurerm_linux_virtual_machine.vm.id]
-  description         = "Triggers self-healing loop instantly when inbound connection metrics drop below 1."
-  window_size         = "PT1M"
+  scopes              = [azurerm_application_insights.app_insights.id]
+  window_size         = "PT5M"
   frequency           = "PT1M"
+  severity            = 1
+  auto_mitigate       = true
 
   criteria {
-    metric_namespace = "Microsoft.Compute/virtualMachines"
-    metric_name      = "Inbound Flows"
+    metric_namespace = "microsoft.insights/components"
+    metric_name      = "availabilityResults/availabilityPercentage"
     aggregation      = "Average"
     operator         = "LessThan"
-    threshold        = 1
+    threshold        = 100
   }
 
   action {
