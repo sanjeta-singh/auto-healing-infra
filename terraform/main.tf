@@ -8,10 +8,6 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.6.0"
     }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.4.0"
-    }
   }
   required_version = ">= 1.3.0"
 }
@@ -25,28 +21,29 @@ provider "azurerm" {
 }
 
 ###########################################################
-## 1. DATA SOURCES, AUTOMATED PACKAGING & LOCAL BUILDS
+## 1. ROBUST PACKAGING (NO ARCHIVE_FILE PROVIDER)
 ###########################################################
 
-resource "null_resource" "pip_install" {
+resource "null_resource" "package_function" {
   triggers = {
-    requirements_hash = filemd5("${path.module}/../automation-function/requirements.txt")
+    src_hash = sha1(join("", [for f in ["function_app.py", "host.json", "requirements.txt"] : filesha1("${path.module}/../automation-function/${f}")]))
   }
-  provisioner "local-exec" {
-    command = "pip3 install -r ${path.module}/../automation-function/requirements.txt --target=\"${path.module}/../automation-function/.python_packages/lib/site-packages\""
-  }
-}
 
-data "archive_file" "function_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/../automation-function"
-  output_path = "${path.module}/function.zip"
-  excludes    = [".venv", "venv", "__pycache__", "function.zip"]
-  depends_on  = [null_resource.pip_install]
+  provisioner "local-exec" {
+    command = <<EOT
+      rm -rf package_root && mkdir -p package_root/deps
+      cp ../automation-function/function_app.py package_root/
+      cp ../automation-function/host.json package_root/
+      cp ../automation-function/requirements.txt package_root/
+      pip3 install -r ../automation-function/requirements.txt --target=package_root/deps
+      cd package_root && zip -r ../function.zip .
+      cd .. && rm -rf package_root
+    EOT
+  }
 }
 
 ###########################################################
-## 2. RESOURCES GROUP & NETWORKING
+## 2. INFRASTRUCTURE
 ###########################################################
 
 resource "azurerm_resource_group" "rg" {
@@ -81,18 +78,6 @@ resource "azurerm_network_security_group" "nsg" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "22"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-
-  security_rule {
-    name                       = "AllowHTTP"
-    priority                   = 1002
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "80"
     source_address_prefix      = "*"
     destination_address_prefix = "*"
   }
@@ -143,8 +128,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
   admin_username                  = var.admin_username_vm
   computer_name                   = var.computer_name
   disable_password_authentication = true
-
-  network_interface_ids = [azurerm_network_interface.nic.id]
+  network_interface_ids           = [azurerm_network_interface.nic.id]
 
   admin_ssh_key {
     username   = var.admin_username_vm
@@ -165,7 +149,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
 }
 
 ###########################################################
-## 3. AUTOMATION & MONITORING INFRASTRUCTURE
+## 3. AUTOMATION & MONITORING
 ###########################################################
 
 resource "random_integer" "storage_id" {
@@ -174,11 +158,45 @@ resource "random_integer" "storage_id" {
 }
 
 resource "azurerm_storage_account" "func_storage" {
-  name                     = "healfuncstorage${random_integer.storage_id.result}"
+  name                     = "healfunc${random_integer.storage_id.result}"
   resource_group_name      = azurerm_resource_group.rg.name
   location                 = azurerm_resource_group.rg.location
   account_tier             = "Standard"
   account_replication_type = "LRS"
+}
+
+resource "azurerm_linux_function_app" "heal_func" {
+  depends_on                 = [null_resource.package_function]
+  name                       = "${var.function_app_name}-${random_integer.storage_id.result}"
+  resource_group_name        = azurerm_resource_group.rg.name
+  location                   = azurerm_resource_group.rg.location
+  service_plan_id            = azurerm_service_plan.func_plan.id
+  storage_account_name       = azurerm_storage_account.func_storage.name
+  storage_account_access_key = azurerm_storage_account.func_storage.primary_access_key
+  zip_deploy_file            = "${path.module}/function.zip"
+
+  site_config {
+    always_on = true
+    application_stack {
+      python_version = "3.12"
+    }
+  }
+
+  app_settings = {
+    "FUNCTIONS_WORKER_RUNTIME" = "python"
+    "WEBSITE_RUN_FROM_PACKAGE" = "1"
+    
+    # --- ADDED THESE TWO CRITICAL SETTINGS ---
+    "AzureWebJobsFeatureFlags" = "EnableWorkerIndexing"
+    "PYTHONPATH"               = "/home/site/wwwroot/deps"
+    # -----------------------------------------
+    
+    "TARGET_VM_NAME"           = azurerm_linux_virtual_machine.vm.name
+    "TARGET_RESOURCE_GROUP"    = azurerm_resource_group.rg.name
+    "TARGET_SUBSCRIPTION_ID"   = "5dd09e90-5d01-4fe1-aa6d-3f17def1c0f8"
+  }
+
+  identity { type = "SystemAssigned" }
 }
 
 resource "azurerm_service_plan" "func_plan" {
@@ -188,6 +206,8 @@ resource "azurerm_service_plan" "func_plan" {
   os_type             = "Linux"
   sku_name            = "S1"
 }
+
+# (Add your existing monitoring resources here: Log Analytics, Insights, Web Test, Metric Alert)
 
 resource "azurerm_log_analytics_workspace" "workspace" {
   name                = "autoheal-log-workspace"
@@ -203,38 +223,6 @@ resource "azurerm_application_insights" "app_insights" {
   resource_group_name = azurerm_resource_group.rg.name
   workspace_id        = azurerm_log_analytics_workspace.workspace.id
   application_type    = "web"
-}
-
-resource "azurerm_linux_function_app" "heal_func" {
-  name                       = "${var.function_app_name}-${random_integer.storage_id.result}"
-  resource_group_name        = azurerm_resource_group.rg.name
-  location                   = azurerm_resource_group.rg.location
-  service_plan_id            = azurerm_service_plan.func_plan.id
-  storage_account_name       = azurerm_storage_account.func_storage.name
-  storage_account_access_key = azurerm_storage_account.func_storage.primary_access_key
-  zip_deploy_file            = data.archive_file.function_zip.output_path
-
-  site_config {
-    always_on = true
-    application_stack {
-      python_version = "3.12"
-    }
-  }
-
-  app_settings = {
-    "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.app_insights.connection_string
-    "FUNCTIONS_WORKER_RUNTIME"              = "python"
-    "AzureWebJobsFeatureFlags"              = "EnableWorkerIndexing"
-    "AzureWebJobsStorage"                   = azurerm_storage_account.func_storage.primary_connection_string
-    "WEBSITE_RUN_FROM_PACKAGE"              = "1"
-    "TARGET_VM_NAME"                        = azurerm_linux_virtual_machine.vm.name
-    "TARGET_RESOURCE_GROUP"                 = azurerm_resource_group.rg.name
-    "TARGET_SUBSCRIPTION_ID"                = "5dd09e90-5d01-4fe1-aa6d-3f17def1c0f8"
-  }
-
-  identity {
-    type = "SystemAssigned"
-  }
 }
 
 resource "azurerm_role_assignment" "vm_group_contributor" {
@@ -259,9 +247,9 @@ resource "azurerm_monitor_action_group" "remediation_ag" {
   short_name          = "AutoHealAG"
 
   webhook_receiver {
-    name                    = "TriggerHealerFunction"
-    service_uri             = "https://${azurerm_linux_function_app.heal_func.default_hostname}/api/remediation_trigger?code=${data.azurerm_function_app_host_keys.func_keys.default_function_key}"
-    use_common_alert_schema = true
+    name                      = "TriggerHealerFunction"
+    service_uri               = "https://${azurerm_linux_function_app.heal_func.default_hostname}/api/remediation_trigger?code=${data.azurerm_function_app_host_keys.func_keys.default_function_key}"
+    use_common_alert_schema   = true
   }
 }
 
